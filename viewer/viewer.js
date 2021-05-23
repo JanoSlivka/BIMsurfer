@@ -1,7 +1,4 @@
-import * as mat4 from "./glmatrix/mat4.js";
-import * as vec2 from "./glmatrix/vec2.js";
 import * as vec3 from "./glmatrix/vec3.js";
-import * as vec4 from "./glmatrix/vec4.js";
 
 import { ProgramManager } from "./programmanager.js";
 import { Lighting } from "./lighting.js";
@@ -16,11 +13,14 @@ import { SSQuad } from "./ssquad.js";
 import { FreezableSet } from "./freezableset.js";
 import { DefaultColors } from "./defaultcolors.js";
 import { AvlTree } from "./collections/avltree.js";
+import { SectionPlaneSet } from "./sectionplaneset.js";
 
 import { COLOR_FLOAT_DEPTH_NORMAL, COLOR_ALPHA_DEPTH } from './renderbuffer.js';
 import { WSQuad } from './wsquad.js';
 import { EventHandler } from "./eventhandler.js";
-import { SectionPlaneHelper } from "./sectionplanehelper.js";
+import { AnimatedVec3 } from "./animatedvec3.js";
+
+export const ALLOW_FLOAT_RENDER_TARGET = true;
 
 // When a change in color results in a different
 // transparency state, the objects needs to be hidden
@@ -39,13 +39,8 @@ const OVERRIDE_FLAG = (1 << 30);
  * - Keeps track of dirty scene
  * - Contains the basic render loop (and delegates to the render layers)
  *
- * @export
  * @class Viewer
  */
-
-const X = vec3.fromValues(1., 0., 0.);
-const Y = vec3.fromValues(0., 1., 0.);
-const Z = vec3.fromValues(0., 0., 1.);
 
 export class Viewer {
 
@@ -56,6 +51,10 @@ export class Viewer {
         this.height = height;
 
         this.defaultColors = settings.defaultColors ? settings.defaultColors : DefaultColors;
+
+        // Controls a couple of settings, such as no section plane cap, no automatic
+        // camera near and far planes.
+        this.geospatialMode = false;
 
         this.stats = stats;
         this.settings = settings;
@@ -72,38 +71,15 @@ export class Viewer {
             return;
         }
 
+        this.useFloatColorBuffer = ALLOW_FLOAT_RENDER_TARGET && this.gl.getExtension("EXT_color_buffer_float");
+
         if (!this.settings.loaderSettings.prepareBuffers || (this.settings.tilingLayerEnabled && this.settings.loaderSettings.tilingLayerReuse)) {
             this.bufferSetPool = new BufferSetPool(1000, this.stats);
         }
 
         this.tmp_unproject = vec3.create();
 
-        this.tmp_sectionU = vec3.create();
-        this.tmp_sectionV = vec3.create();
-
-        this.tmp_sectionA = vec3.create();
-        this.tmp_sectionB = vec3.create();
-        this.tmp_sectionC = vec3.create();
-        this.tmp_sectionD = vec3.create();
-
-        this.tmp_section_dir_2d = vec4.create();
-
         this.pickIdCounter = 1;
-
-        this.sectionPlaneIsDisabled = true;
-
-        this.sectionPlaneValuesDisabled = new Float32Array(4);
-        this.sectionPlaneValuesDisabled.set([0, 0, 0, 1]);
-
-        this.sectionPlaneValues = new Float32Array(4);
-        this.sectionPlaneValues2 = new Float32Array(4);
-
-        this.sectionPlaneValues.set(this.sectionPlaneValuesDisabled);
-        // this.sectionPlaneValues.set([0,1,1,-5000]);
-        this.sectionPlaneValues2.set(this.sectionPlaneValues);
-
-        // A SVG canvas overlay polygon to indicate section plane positioning
-        this.sectionplanePoly = null;
 
         // Picking ID (unsigned int) -> ViewObject
         // This is an array now since the picking ids form a continues array
@@ -113,20 +89,28 @@ export class Viewer {
         this.animationListeners = [];
         this.colorRestore = [];
 
+        this.sectionPlanes = new SectionPlaneSet({ viewer: this, n: 6 });
+
+        // For geometry loaded from non-bimserver sources we auto-increment
+        // an ID on the spot in the loader.
+        this.oidCounter = 1;
+
         // User can override this, default assumes strings to be used as unique object identifiers
-        if (this.settings.loaderSettings.useUuidAndRid) {
-            const collator = new Intl.Collator();
-            // TODO there is really no need to use a locale-aware comparator here, but somehow > or < does not seem to work, where it work should for string
-            this.uniqueIdCompareFunction = (a, b) => {
-                //        		return a == b ? 0 : (a > b ? 1 : -1);
-                return collator.compare(a, b);
-            };
+        if (this.settings.loaderSettings.uniqueIdCompareFunction) {
+            this.uniqueIdCompareFunction = this.settings.loaderSettings.uniqueIdCompareFunction;
             this.idAugmentationFunction = (id) => ("O" + id);
         } else {
-            this.uniqueIdCompareFunction = (a, b) => {
-                return a - b;
-            };
-            this.idAugmentationFunction = (id) => (id | OVERRIDE_FLAG);
+            if (this.settings.loaderSettings.useUuidAndRid) {
+                const collator = new Intl.Collator();
+                // TODO there is really no need to use a locale-aware comparator here, but somehow > or < does not seem to work, where it work should for string
+                this.uniqueIdCompareFunction = collator.compare;
+                this.idAugmentationFunction = (id) => ("O" + id);
+            } else {
+                this.uniqueIdCompareFunction = (a, b) => {
+                    return a - b;
+                };
+                this.idAugmentationFunction = (id) => (id | OVERRIDE_FLAG);
+            }
         }
 
         /* Next function serves two purposes:
@@ -167,37 +151,53 @@ export class Viewer {
         this.useOrderIndependentTransparency = this.settings.realtimeSettings.orderIndependentTransparency;
 
         // 0 -> Not dirty, 1 -> Kinda dirty, but rate-limit the repaints to 2/sec, 2 -> Really dirty, repaint ASAP
-        this.dirty = 0;
+        this._dirty = 0;
         this.lastRepaint = 0;
 
         //        window._debugViewer = this;  // HACK for console debugging
 
         this.eventHandler = new EventHandler();
 
+        this.sectionPlaneIndex = 0;
+
         if ("OffscreenCanvas" in window && canvas instanceof OffscreenCanvas) {
         } else {
             // Tabindex required to be able add a keypress listener to canvas
             canvas.setAttribute("tabindex", "0");
-            canvas.addEventListener("keypress", (evt) => {
-                if (evt.key === 'H') {
-                    this.resetVisibility();
-                } else if (evt.key === 'h') {
-                    this.setVisibility(this.selectedElements, false, false);
-                    this.selectedElements.clear();
-                } else if (evt.key === 'C') {
-                    this.resetColors();
-                } else if (evt.key === 'c' || evt.key === 'd') {
-                    let R = Math.random;
-                    let clr = [R(), R(), R(), evt.key === 'd' ? R() : 1.0];
-                    this.setColor(new Set(this.selectedElements), clr);
-                    //        			this.selectedElements.clear();
-                } else {
-                    // Don't do a drawScene for every key pressed
-                    return;
-                }
-                //            this.drawScene();
-            });
+            if (!this.settings.disableDefaultKeyBindings) {
+                canvas.addEventListener("keypress", (evt) => {
+                    if (evt.key === 'H') {
+                        this.resetVisibility();
+                    } else if (evt.key === 'h') {
+                        this.setVisibility(this.selectedElements, false, false);
+                        this.selectedElements.clear();
+                    } else if (evt.key === 'C') {
+                        this.resetColors();
+                    } else if (evt.key === 'c' || evt.key === 'd') {
+                        let R = Math.random;
+                        let clr = [R(), R(), R(), evt.key === 'd' ? R() : 1.0];
+                        this.setColor(new Set(this.selectedElements), clr);
+                        //        			this.selectedElements.clear();
+                    } else {
+                        // Don't do a drawScene for every key pressed
+                        return;
+                    }
+                    //            this.drawScene();
+                });
+            }
         }
+
+        // These parameters are used for camera control sensitivity
+        this.lastRecordedDepth = null;
+        this.recordedDepthAt = 0;
+    }
+
+    set dirty(dirty) {
+        this._dirty = dirty;
+    }
+
+    get dirty() {
+        return this._dirty;
     }
 
     callByType(method, types, ...args) {
@@ -208,7 +208,7 @@ export class Viewer {
         return method.call(this, elems, ...args);
     }
 
-    setVisibility(elems, visible, sort = true) {
+    setVisibility(elems, visible, sort = true, fireEvent = true) {
         elems = Array.from(elems);
         // @todo. until is properly asserted, documented somewhere, it's probably best to explicitly sort() for now.
         elems.sort(this.uniqueIdCompareFunction);
@@ -228,14 +228,34 @@ export class Viewer {
             };
 
             this.dirty = 2;
-
-            this.eventHandler.fire("visbility_changed", elems, visible);
+            if (fireEvent) {
+                var map = this.splitElementsPerRenderLayer(elems);
+                for (const [renderLayer, elems] of map) {
+                    this.eventHandler.fire("visbility_changed", renderLayer, elems, visible);
+                }
+            }
 
             return Promise.resolve();
         });
     }
 
-    setSelectionState(elems, selected, clear) {
+    splitElementsPerRenderLayer(elems) {
+        var map = new Map();
+        for (var elem of elems) {
+            var viewObject = this.viewObjects.get(elem);
+            if (viewObject) {
+                var set = map.get(viewObject.renderLayer);
+                if (!set) {
+                    set = [];
+                    map.set(viewObject.renderLayer, set);
+                }
+                set.push(elem);
+            }
+        }
+        return map;
+    }
+
+    setSelectionState(elems, selected, clear, fireEvent = true) {
         return this.selectedElements.batch(() => {
             if (clear) {
                 this.selectedElements.clear();
@@ -250,7 +270,9 @@ export class Viewer {
 
             return Promise.resolve();
         }).then(() => {
-            this.eventHandler.fire("selection_state_changed", elems, selected);
+            if (fireEvent) {
+                this.eventHandler.fire("selection_state_changed", elems, selected);
+            }
         });
     }
 
@@ -324,7 +346,7 @@ export class Viewer {
         return bufferSetsToUpdate;
     }
 
-    setColor(elems, clr) {
+    setColor(elems, clr, fireEvent = true) {
         let aug = this.idAugmentationFunction;
         let promise = this.invisibleElements.batch(() => {
             var bufferSetsToUpdate = this.generateBufferSetToOidsMap(elems);
@@ -395,6 +417,8 @@ export class Viewer {
                                 } else {
                                     buffer = bufferSet.owner.flushBuffer(copiedBufferSet, false);
 
+                                    buffer.lineIndexBuffers = copiedBufferSet.lineIndexBuffers;
+
                                     // Note that this is an attribute on the bufferSet, but is
                                     // not applied to the actual webgl vertex data.
                                     buffer.uniqueId = aug(uniqueId);
@@ -408,8 +432,13 @@ export class Viewer {
                         }
                     });
                 }
-                this.dirty = 2;
-                this.eventHandler.fire("color_changed", elems, clr);
+                this._dirty = 2;
+                if (fireEvent) {
+                    var map = this.splitElementsPerRenderLayer(elems);
+                    for (const [renderLayer, elems] of map) {
+                        this.eventHandler.fire("color_changed", renderLayer, elems, clr);
+                    }
+                }
             });
         });
         return promise;
@@ -417,7 +446,7 @@ export class Viewer {
 
     init() {
         var promise = new Promise((resolve, reject) => {
-            this.dirty = 2;
+            this._dirty = 2;
             this.then = 0;
             if (this.settings.autoRender) {
                 this.running = true;
@@ -433,7 +462,7 @@ export class Viewer {
 
             this.cameraControl = new CameraControl(this);
             this.lighting = new Lighting(this);
-            this.programManager = new ProgramManager(this.gl, this.settings);
+            this.programManager = new ProgramManager(this, this.gl, this.settings);
 
             this.programManager.load().then(() => {
                 resolve();
@@ -444,19 +473,23 @@ export class Viewer {
                 }
             });
 
-            this.pickBuffer = new RenderBuffer(this.canvas, this.gl, COLOR_FLOAT_DEPTH_NORMAL);
-            this.oitBuffer = new RenderBuffer(this.canvas, this.gl, COLOR_ALPHA_DEPTH);
+            this.pickBuffer = new RenderBuffer(this, this.canvas, this.gl, COLOR_FLOAT_DEPTH_NORMAL);
+            this.oitBuffer = new RenderBuffer(this, this.canvas, this.gl, COLOR_ALPHA_DEPTH);
             this.quad = new SSQuad(this.gl);
-            this.quad2 = new WSQuad(this, this.gl);
         });
         return promise;
     }
 
     setDimensions(width, height) {
+        if (width == null || height == null) {
+            throw "Invalid dimensions: " + width + ", " + height;
+        }
         this.width = width;
         this.height = height;
         this.camera.perspective._dirty = true;
         this.updateViewport();
+        this.overlay.resize();
+        this.render();
     }
 
     render(now) {
@@ -466,10 +499,10 @@ export class Viewer {
 
         this.fps++;
 
-        var wasDirty = this.dirty;
-        if (this.dirty == 2 || (this.dirty == 1 && now - this.lastRepaint > 500)) {
-            let reason = this.dirty;
-            this.dirty = 0;
+        var wasDirty = this._dirty;
+        if (this._dirty == 2 || (this._dirty == 1 && now - this.lastRepaint > 500)) {
+            let reason = this._dirty;
+            this._dirty = 0;
             this.drawScene(reason, { without: this.invisibleElements });
             this.lastRepaint = now;
         }
@@ -486,8 +519,11 @@ export class Viewer {
             this.stats.update();
         }
 
-        if (this.running) {
+        if (this.running || AnimatedVec3.ACTIVE_ANIMATIONS) {
             requestAnimationFrame((now) => {
+                if (AnimatedVec3.ACTIVE_ANIMATIONS) {
+                    this.camera.forceBuild();
+                }
                 this.render(now);
             });
         }
@@ -498,13 +534,33 @@ export class Viewer {
 
     internalRender(elems, t) {
         for (var transparency of (t || [false, true])) {
-            for (var renderLayer of this.renderLayers) {
-                renderLayer.render(transparency, false, elems);
-            }
-            if (this.settings.realtimeSettings.drawLineRenders) {
+
+            //        	this.gl.enable(this.gl.POLYGON_OFFSET_FILL);
+            //        	this.gl.polygonOffset(2, 3);
+
+            this.gl.disable(this.gl.CULL_FACE);
+
+            for (var twoSidedTriangles of [false, true]) {
+                //            	if (twoSidedTriangles) {
+                //            		this.gl.disable(this.gl.CULL_FACE);
+                //            	} else {
+                //            		this.gl.enable(this.gl.CULL_FACE);
+                //            	}
                 for (var renderLayer of this.renderLayers) {
-                    renderLayer.render(transparency, true, elems);
+                    renderLayer.render(transparency, false, twoSidedTriangles, elems);
                 }
+            }
+
+            //        	this.gl.disable(this.gl.POLYGON_OFFSET_FILL);
+
+            if (this.settings.realtimeSettings.drawLineRenders) {
+                this.gl.depthFunc(this.gl.LESS);
+                for (var twoSidedTriangles of [false, true]) {
+                    for (var renderLayer of this.renderLayers) {
+                        renderLayer.render(transparency, true, twoSidedTriangles, elems);
+                    }
+                }
+                this.gl.depthFunc(this.gl.LEQUAL);
             }
         }
     }
@@ -530,11 +586,11 @@ export class Viewer {
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
         gl.disable(gl.CULL_FACE);
 
-        this.sectionPlaneValues.set(this.sectionPlaneValues2);
+        this.sectionPlanes.tempRestore();
 
         for (var renderLayer of this.renderLayers) {
             renderLayer.prepareRender(reason);
-            renderLayer.renderLines();
+            //            renderLayer.renderLines();
         }
 
         gl.enable(gl.CULL_FACE);
@@ -544,19 +600,33 @@ export class Viewer {
                 this.resetToDefaultView();
             }
 
-            if (!this.sectionPlaneIsDisabled) {
+            // On what side of the plane is the camera eye?
+            let planeIsVisbible = (p) => vec3.dot(p.values, this.camera.eye) > p.values[3];
+
+            if (!this.geospatialMode && this.sectionPlanes.planes.some(p => !p.isDisabled && planeIsVisbible(p))) {
+
+                // Fill depth buffer with quads
+                // ----------------------------
+
                 gl.stencilMask(0xff);
-                this.quad2.position(this.modelBounds, this.sectionPlaneValues);
                 gl.colorMask(false, false, false, false);
+
+                // @todo simply draw quad twice with opposing windings so that we
+                // can remove the cull_face toggle here?
                 gl.disable(gl.CULL_FACE);
-                this.quad2.draw();
+
+                this.sectionPlanes.tempRestore();
+                this.sectionPlanes.planes.filter(sp => !sp.isDisabled).forEach(sp => sp.drawQuad());
+
+                // Draw scene twice without planes and without depth test
+                // ------------------------------------------------------
+
                 gl.enable(gl.CULL_FACE);
                 gl.depthMask(false);
-
                 gl.enable(gl.STENCIL_TEST);
                 gl.stencilFunc(gl.ALWAYS, 1, 0xff);
 
-                this.sectionPlaneValues.set(this.sectionPlaneValuesDisabled);
+                this.sectionPlanes.tempDisable();
 
                 gl.stencilOp(gl.KEEP, gl.KEEP, gl.INCR); // increment on pass
                 gl.cullFace(gl.BACK);
@@ -566,18 +636,33 @@ export class Viewer {
                 gl.cullFace(gl.FRONT);
                 this.internalRender(what, [false]);
 
-                this.sectionPlaneValues.set(this.sectionPlaneValues2);
-                const eyePlaneDist = this.lastSectionPlaneAdjustment = Math.abs(vec3.dot(this.camera.eye, this.sectionPlaneValues2) - this.sectionPlaneValues2[3]);
-                this.sectionPlaneValues[3] -= 1.e-3 * eyePlaneDist;
+                this.sectionPlanes.tempRestore();
+
+                // const eyePlaneDist = this.lastSectionPlaneAdjustment = Math.abs(vec3.dot(this.camera.eye, sp.values2) - sp.values2[3]);
+                // sp.values[3] -= 1.e-3 * eyePlaneDist;
+
+                // Renable color mask and draw planes with stencil
+                // -----------------------------------------------
 
                 gl.stencilFunc(gl.EQUAL, 1, 0xff);
                 gl.colorMask(true, true, true, true);
                 gl.depthMask(true);
                 gl.clear(gl.DEPTH_BUFFER_BIT);
                 gl.disable(gl.CULL_FACE);
-                this.quad2.draw();
-                gl.enable(gl.CULL_FACE);
 
+                this.sectionPlanes.tempRestore();
+                for (var i = 0; i < this.sectionPlanes.planes.length; ++i) {
+                    // @todo planes pointing away from camera do not need to be rendered
+                    let sp = this.sectionPlanes.planes[i];
+                    if (!sp.isDisabled && planeIsVisbible(sp)) {
+                        sp.drawQuad();
+                    }
+                }
+
+                // Restore main render settings
+                // ----------------------------
+
+                gl.enable(gl.CULL_FACE);
                 gl.cullFace(gl.BACK);
                 gl.disable(gl.STENCIL_TEST);
                 gl.stencilFunc(gl.ALWAYS, 1, 0xff);
@@ -614,7 +699,9 @@ export class Viewer {
         }
 
         // From now on section plane is disabled.
-        this.sectionPlaneValues.set(this.sectionPlaneValuesDisabled);
+        for (let sp of this.sectionPlanes.planes) {
+            sp.tempDisable();
+        }
 
         // Selection outlines require face culling to be disabled.
         gl.disable(gl.CULL_FACE);
@@ -641,7 +728,7 @@ export class Viewer {
             gl.disable(gl.STENCIL_TEST);
 
             for (var renderLayer of this.renderLayers) {
-                renderLayer.renderSelectionOutlines(this.selectedElements, 0.001);
+                renderLayer.renderSelectionOutlines(this.selectedElements, 0.002);
             }
         }
 
@@ -663,24 +750,23 @@ export class Viewer {
         //		);
     }
 
-    resetToDefaultView(modelBounds = this.modelBounds) {
-        this.camera.target = [0, 0, 0];
-        this.camera.eye = [0, 1, 0];
+    resetToDefaultView(modelBounds = this.modelBounds, animate = false) {
+        //        this.camera.target = [0, 0, 0];
+        //        this.camera.eye = [0, -1, 0];
         this.camera.up = [0, 0, 1];
         this.camera.worldAxis = [ // Set the +Z axis as World "up"
             1, 0, 0, // Right
             0, 0, 1, // Up
             0, -1, 0  // Forward
         ];
-        this.camera.viewFit(modelBounds); // Position camera so that entire model bounds are in view
+        this.camera.viewFit({ aabb: modelBounds, viewDirection: [0, -1, 0], animate: animate }); // Position camera so that entire model bounds are in view
         this.cameraSet = true;
         this.camera.forceBuild();
     }
 
     removeSectionPlaneWidget() {
-        if (this.sectionplanePoly) {
-            this.sectionplanePoly.destroy();
-            this.sectionplanePoly = null;
+        for (let sp of this.sectionPlanes.planes) {
+            sp.destroy();
         }
     }
 
@@ -697,95 +783,76 @@ export class Viewer {
     }
 
     positionSectionPlaneWidget(params) {
-        let p = this.pick({ canvasPos: params.canvasPos, select: false });
-        if ((p.normal && p.coordinates && p.object)) {
-            p.normal = this.sectionPlaneHelper.getNormalSectionPlane(p.normal);
-            p.coordinates = this.sectionPlaneHelper.getCoordinatesSectionPlane(p.coordinates);
-            this.positionSectionPlaneWidgetCore(p.normal, p.coordinates);
-        }
-    }
-
-    positionSectionPlaneWidgetCore(normal, coordinates) {
-        let scale = this.sectionPlaneHelper.getScaleSectionPlane(normal);
-        let ref = this.sectionPlaneHelper.getRefSectionPlane(normal);
-        vec3.cross(this.tmp_sectionU, normal, ref);
-        vec3.cross(this.tmp_sectionV, normal, this.tmp_sectionU);
-        vec3.scale(this.tmp_sectionU, this.tmp_sectionU, scale.U);
-        vec3.scale(this.tmp_sectionV, this.tmp_sectionV, scale.V);
-        // ---
-
-        vec3.add(this.tmp_sectionA, this.tmp_sectionU, coordinates);
-        vec3.add(this.tmp_sectionB, this.tmp_sectionU, coordinates);
-
-        vec3.negate(this.tmp_sectionU, this.tmp_sectionU);
-
-        vec3.add(this.tmp_sectionC, this.tmp_sectionU, coordinates);
-        vec3.add(this.tmp_sectionD, this.tmp_sectionU, coordinates);
-
-        // ---
-
-        vec3.add(this.tmp_sectionA, this.tmp_sectionV, this.tmp_sectionA);
-        vec3.add(this.tmp_sectionC, this.tmp_sectionV, this.tmp_sectionC);
-
-        vec3.negate(this.tmp_sectionV, this.tmp_sectionV);
-
-        vec3.add(this.tmp_sectionB, this.tmp_sectionV, this.tmp_sectionB);
-        vec3.add(this.tmp_sectionD, this.tmp_sectionV, this.tmp_sectionD);
-
-        // ---
-
-        this.ps = [this.tmp_sectionA, this.tmp_sectionB, this.tmp_sectionD, this.tmp_sectionC, this.tmp_sectionA];
-        if (this.sectionplanePoly) {
-            this.sectionplanePoly.points = this.ps;
-        } else {
-            this.sectionplanePoly = this.overlay.createWorldSpacePolyline(this.ps, this.sectionPlaneHelper);
+        if (this.sectionPlaneIndex < this.sectionPlanes.planes.length) {
+            let p = this.pick({ canvasPos: params.canvasPos, select: false });
+            if (p.normal && p.coordinates && p.object) {
+                p.normal = this.sectionPlaneHelper.getNormalSectionPlane(p.normal);
+                p.coordinates = this.sectionPlaneHelper.getCoordinatesSectionPlane(p.coordinates);
+                this.sectionPlanes.planes[this.sectionPlaneIndex].position(p.coordinates, p.normal);
+            }
         }
     }
 
     enableSectionPlane(params) {
         let p = this.pick({ canvasPos: params.canvasPos, select: false });
         if (p.normal && p.coordinates && p.depth) {
-            // Changed: for new section
-            p.normal = this.sectionPlaneHelper.getNormalSectionPlane(p.normal);
-            this.sectionPlaneHelper.saveLastNormalSectionPlane(p.normal);
-            const depth = (this.sectionPlaneHelper.isFreeSectionIndex())
-                ? vec3.dot(p.coordinates, p.normal)
-                : this.ps[0][this.sectionPlaneHelper.sectionIndex];
-            this.sectionPlaneValues.set(p.normal.subarray(0, 3));
-            this.initialSectionPlaneD = this.sectionPlaneValues[3] = depth;
-            this.sectionPlaneValues2.set(this.sectionPlaneValues);
-            this.sectionPlaneIsDisabled = false;
-            this.sectionPlaneDepth = p.depth;
-            let cp = [params.canvasPos[0] / this.width, - params.canvasPos[1] / this.height];
-            this.sectionPlaneDownAt = cp;
-            this.dirty = 2;
+            if (this.sectionPlaneIndex < this.sectionPlanes.planes.length) {
+                this.sectionPlanes.planes[this.sectionPlaneIndex].enable(params.canvasPos, p.coordinates, p.normal, p.depth);
+                this.sectionPlaneIndex++;
+                this.dirty = 2;
+            }
             return true;
+        } else {
+            this.sectionPlanes.disable();
+            this.sectionPlaneIndex = 0;
+            return false;
         }
-        return false;
     }
 
     disableSectionPlane() {
-        this.sectionPlaneValues.set(this.sectionPlaneValuesDisabled);
-        this.sectionPlaneValues2.set(this.sectionPlaneValuesDisabled);
-        this.sectionPlaneIsDisabled = true;
+        this.sectionPlanes.planes[0].disable();
+
         this.dirty = 2;
         // Changed: for new section
         this.sectionPlaneHelper.disableSectionPlane();
     }
 
     moveSectionPlane(params) {
-        this.tmp_section_dir_2d.set(this.sectionPlaneValues2);
-        this.tmp_section_dir_2d[3] = 0.;
-        vec4.transformMat4(this.tmp_section_dir_2d, this.tmp_section_dir_2d, this.camera.viewProjMatrix);
-        let cp = [params.canvasPos[0] / this.width, - params.canvasPos[1] / this.height];
-        vec2.subtract(this.tmp_section_dir_2d.subarray(2), cp, this.sectionPlaneDownAt);
-        this.tmp_section_dir_2d[1] /= this.width / this.height;
-        let d = vec2.dot(this.tmp_section_dir_2d, this.tmp_section_dir_2d.subarray(2)) * this.sectionPlaneDepth;
-        this.sectionPlaneValues2[3] = this.initialSectionPlaneD + d;
+        this.sectionPlanes.planes[this.sectionPlaneIndex - 1].move(params.canvasPos);
         // Changed: for new section
         this.sectionPlaneHelper.isSectionMoving = true;
         this.moveSectionPlaneWidget(this.sectionPlaneValues2[3]);
+
         this.dirty = 2;
+    }
+
+    setMeasurementPoint(params) {
+        let p = this.pick({ canvasPos: params.canvasPos, select: false });
+        if (p.normal && p.coordinates && p.depth) {
+            if (this.activeMeasurement) {
+                this.activeMeasurement.setSecondPoint(p.coordinates);
+                if (params.commit) {
+                    this.activeMeasurement.fixed = true;
+                    this.activeMeasurement = null;
+                    this.overlay.update();
+                }
+            } else {
+                this.activeMeasurement = this.overlay.addMeasurement(p.coordinates, p.normal, params.shift);
+            }
+        }
+    }
+
+    setMeasurementConstrained(b) {
+        this.activeMeasurement.constrain = b;
+        this.overlay.update();
+    }
+
+    deleteAllMeasurements() {
+        for (let n of this.overlay.nodes) {
+            if (n.constructor.name == 'MeasurementNode') {
+                n.destroy();
+            }
+        }
     }
 
     /**
@@ -798,14 +865,19 @@ export class Viewer {
     pick(params) { // Returns info on the object at the given canvas coordinates
         var canvasPos = params.canvasPos;
         if (!canvasPos) {
-            throw "param expected: canvasPos";
+            throw "param epected: canvasPos";
         }
 
-        this.sectionPlaneValues.set(this.sectionPlaneValues2);
-        if (!this.sectionPlaneIsDisabled) {
+        this.sectionPlanes.tempRestore();
+
+        // TODO when the navigation has not changed since the last picking action, we should probably be able to reuse the previously generated render target?
+
+        /*
+        if (!this.sectionPlanes.planes[0].isDisabled) {
             // tfk: I forgot what this is.
-            this.sectionPlaneValues[3] -= 1.e-3 * this.lastSectionPlaneAdjustment;
+            this.sectionPlanes.planes[0].values[3] -= 1.e-3 * this.lastSectionPlaneAdjustment;        
         }
+        */
 
         this.pickBuffer.bind();
 
@@ -824,8 +896,11 @@ export class Viewer {
         this.gl.disable(this.gl.BLEND);
 
         for (var transparency of [false, true]) {
-            for (var renderLayer of this.renderLayers) {
-                renderLayer.render(transparency, false, { without: this.invisibleElements, pass: 'pick' });
+            for (var twoSidedTriangles of [false, true]) {
+                // TODO change back face culling setting based on twoSidedTriangles?
+                for (var renderLayer of this.renderLayers) {
+                    renderLayer.render(transparency, false, twoSidedTriangles, { without: this.invisibleElements, pass: 'pick' });
+                }
             }
         }
 
@@ -854,27 +929,42 @@ export class Viewer {
         if (viewObject) {
             var uniqueId = viewObject.uniqueId;
             if (params.select !== false) {
+                var triggered = false;
                 if (!params.shiftKey) {
                     if (this.selectedElements.size > 0) {
-                        this.eventHandler.fire("selection_state_changed", this.selectedElements, false);
+                        this.eventHandler.fire("selection_state_set", viewObject.renderLayer, [uniqueId], true);
+                        triggered = true;
                         this.selectedElements.clear();
+                        this.addToSelection(uniqueId);
                     }
                 }
-                if (this.selectedElements.has(uniqueId)) {
-                    this.selectedElements.delete(uniqueId);
-                    this.eventHandler.fire("selection_state_changed", [uniqueId], false);
-                } else {
-                    this.addToSelection(uniqueId);
-                    this.eventHandler.fire("selection_state_changed", [uniqueId], true);
+                if (!triggered) {
+                    if (this.selectedElements.has(uniqueId) && !params.onlyAdd) {
+                        this.selectedElements.delete(uniqueId);
+                        this.eventHandler.fire("selection_state_changed", viewObject.renderLayer, [uniqueId], false);
+                    } else {
+                        this.addToSelection(uniqueId);
+                        this.eventHandler.fire("selection_state_changed", viewObject.renderLayer, [uniqueId], true);
+                    }
                 }
             }
+            this.lastRecordedDepth = depth;
+            this.recordedDepthAt = +new Date();
+            //            console.log("recording depth at", depth);
             return { object: viewObject, normal: normal, coordinates: this.tmp_unproject, depth: depth };
         } else if (params.select !== false) {
             if (this.selectedElements.size > 0) {
-                this.eventHandler.fire("selection_state_changed", this.selectedElements, false);
+                var map = this.splitElementsPerRenderLayer(this.selectedElements);
+                for (const [renderLayer, elems] of map) {
+                    this.eventHandler.fire("selection_state_changed", renderLayer, elems, false);
+                }
                 this.selectedElements.clear();
             }
         }
+
+        this.lastRecordedDepth = null;
+        this.recordedDepthAt = +new Date();
+
         // Changed: for new section
         return { object: null, coordinates: this.tmp_unproject, depth: depth, normal: normal };
     }
@@ -901,8 +991,8 @@ export class Viewer {
         return this.getPickColorForPickId(pickId);
     }
 
-    setModelBounds(modelBounds) {
-        if (this.modelBounds != null) {
+    setModelBounds(modelBounds, force = false) {
+        if (!force && this.modelBounds != null) {
             // "Merge"
             this.modelBounds[0] = Math.min(this.modelBounds[0], modelBounds[0]);
             this.modelBounds[1] = Math.min(this.modelBounds[1], modelBounds[1]);
@@ -943,7 +1033,11 @@ export class Viewer {
     }
 
     addViewObject(uniqueId, viewObject) {
-        viewObject.pickId = this.pickIdCounter++;
+        if (this.viewObjects.has(uniqueId)) {
+            viewObject.pickId = this.viewObjects.get(uniqueId).pickId;
+        } else {
+            viewObject.pickId = this.pickIdCounter++;
+        }
         this.viewObjects.set(uniqueId, viewObject);
         this.pickIdToViewObject[viewObject.pickId] = viewObject;
 
@@ -952,17 +1046,28 @@ export class Viewer {
         this.viewObjectsByType.set(viewObject.type, byType);
     }
 
-    viewFit(ids) {
+    getAabbFor(ids) {
+        return ids.map(this.viewObjects.get.bind(this.viewObjects))
+            .filter((o) => o != null && o.globalizedAabb != null)
+            .map((o) => o.globalizedAabb)
+            .reduce(Utils.unionAabb, Utils.emptyAabb());
+    }
+
+    viewFit(ids, settings) {
+        if (ids.length == 0) {
+            return Promise.resolve();
+        }
         return new Promise((resolve, reject) => {
-            let aabb = ids.map(this.viewObjects.get.bind(this.viewObjects))
-                .filter((o) => o != null && o.globalizedAabb != null)
-                .map((o) => o.globalizedAabb)
-                .reduce(Utils.unionAabb, Utils.emptyAabb());
+            const aabb = this.getAabbFor(ids);
             if (Utils.isEmptyAabb(aabb)) {
                 console.error("No AABB for objects", ids);
                 reject();
             } else {
-                this.camera.viewFit(aabb);
+                if (!settings) {
+                    settings = {};
+                }
+                settings.aabb = aabb;
+                this.camera.viewFit(settings);
                 this.dirty = 2;
                 resolve();
             }

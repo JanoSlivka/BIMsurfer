@@ -39,7 +39,7 @@ export class FatLineRenderer {
 		this.indices = Array();
 		this.quantize = settings.quantize || false;
 		this.matrixMap = new Map();
-		this.croid = null;
+		this.uniqueModelId = null;
 		this.unquantizationMatrix = unquantizationMatrix;
 		this.nrIndices = 0;
 
@@ -160,14 +160,14 @@ export class FatLineRenderer {
 		this.gl.uniformMatrix4fv(this.programInfo.uniformLocations.projectionMatrix, false, viewer.camera.projMatrix);
 		this.gl.uniformMatrix4fv(this.programInfo.uniformLocations.viewMatrix, false, viewer.camera.viewMatrix);
 		this.gl.uniform3fv(this.programInfo.uniformLocations.postProcessingTranslation, renderLayer.postProcessingTranslation);
-
+		
 		const aspect = viewer.width / viewer.height;
 		this.gl.uniform1f(this.programInfo.uniformLocations.aspect, aspect);
 
 		if (this.quantize) {
-			if (this.croid) {
+			if (this.uniqueModelId) {
 				// This is necessary for line renderings of reused geometries.
-				this.gl.uniformMatrix4fv(this.programInfo.uniformLocations.vertexQuantizationMatrix, false, viewer.vertexQuantization.getUntransformedInverseVertexQuantizationMatrixForCroid(this.croid));
+				this.gl.uniformMatrix4fv(this.programInfo.uniformLocations.vertexQuantizationMatrix, false, viewer.vertexQuantization.getUntransformedInverseVertexQuantizationMatrixForUniqueModelId(this.uniqueModelId));
 			} else {
 				if (this.unquantizationMatrix) {
 					this.gl.uniformMatrix4fv(this.programInfo.uniformLocations.vertexQuantizationMatrix, false, this.unquantizationMatrix);

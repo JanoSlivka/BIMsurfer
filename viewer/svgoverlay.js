@@ -1,5 +1,7 @@
 import * as mat4 from "./glmatrix/mat4.js";
 import * as vec3 from "./glmatrix/vec3.js";
+import * as vec2 from "./glmatrix/vec2.js"
+import * as mat2 from "./glmatrix/mat2.js"
 
 class SvgOverlayNode {
     constructor(overlay, svgElem) {
@@ -12,6 +14,9 @@ class SvgOverlayNode {
         let v = this.isVisible();
         if (v !== this._lastVisibilityState) {
             this.svgElem.setAttribute("visibility", v ? "visible" : "hidden");
+        }
+        if (this.beforeUpdate) {
+            this.beforeUpdate();
         }
         if (this._lastVisibilityState = v) {
             this.doUpdate();
@@ -35,9 +40,9 @@ class OrbitCenterOverlayNode extends SvgOverlayNode {
     }
 
     doUpdate() {
-        let [x, y] = this.overlay.transformPoint(this.camera.center);
-        this.svgElem.setAttribute("cx", x);
-        this.svgElem.setAttribute("cy", y);
+        let xy = this.overlay.transformPoint(this.camera.center);
+        this.svgElem.setAttribute("cx", xy[0]);
+        this.svgElem.setAttribute("cy", xy[1]);
     }
 }
 
@@ -56,7 +61,7 @@ class PathOverlayNode extends SvgOverlayNode {
     }
 
     createPathAttribute() {
-        return "M" + this._points.map((p) => this.overlay.transformPoint(p)).join(" L");
+        return "M" + this._points.map((p) => this.overlay.toString(this.overlay.transformPoint(p))).join(" L");
     }
 
     isVisible() {
@@ -73,7 +78,7 @@ class PathOverlayNode extends SvgOverlayNode {
     }
 
     doUpdate() {
-        this.svgElem.setAttribute("d", this.createPathAttribute(this._points));
+        this.svgElem.setAttribute("d", this.createPathAttribute());
         // Changed: for new section
         this.svgElem.setAttribute("fill", this.sectionPlaneHelper.isSectionMoving ? "red" : "lightblue");
     }
@@ -83,7 +88,6 @@ class PathOverlayNode extends SvgOverlayNode {
  * A SVG overlay that is synced with the WebGL viewport for efficiently rendering
  * two-dimensional elements such as text, that are not easily rendered using WebGL.
  *
- * @export
  * @class SvgOverlay
  */
 export class SvgOverlay {
@@ -109,7 +113,43 @@ export class SvgOverlay {
         (wrapper ? wrapper : document.body).appendChild(svg);
         this.hasWrapper = !!wrapper;
 
+        let defs = this.create("defs", null, null);
+
+        for (let i = 0; i < 2; ++i) {
+            let marker = this.create("marker", {
+                id: `m${i}`,
+                markerWidth: 13,
+                markerHeight: 13,
+                refX: [10, 2][i],
+                refY: 6,
+                orient: "auto"
+            }, null, defs);
+
+            this.create("path", {
+                d: ["M2,2 L2,11 L10,6 L2,2", "M10,2 L10,11 L2,6 L10,2"][i],
+            }, {
+                fill: "#000000"
+            }, marker);
+
+            this.create("path", {
+                d: ["M10,2 L10,11", "M2,2 L2,11"][i],
+            }, {
+                stroke: "#000000",
+                strokeWidth: 1
+            }, marker);
+        }
+
+        // Initialize by resize()
+        this.boundaryPoints = [
+            vec2.create(),
+            vec2.create(),
+            vec2.create(),
+            vec2.create()
+        ];
+        this.centerPoint = vec2.create();
+
         this.resize();
+
         this.camera.listeners.push(this.update.bind(this));
         this._orbitCenter = this.create("circle", {
             visibility: "hidden",
@@ -127,8 +167,16 @@ export class SvgOverlay {
     }
 
     transformPoint(p) {
-        vec3.transformMat4(this.tmp, p, this.camera.viewProjMatrix);
-        return [+this.tmp[0] * this.w + this.w, -this.tmp[1] * this.h + this.h]
+        let t = this.tmp;
+        vec3.transformMat4(t, p, this.camera.viewProjMatrix);
+        t[1] *= -1;
+        vec2.multiply(t, t, this.wh);
+        vec2.add(t, t, this.wh);
+        return t;
+    }
+
+    toString(t) {
+        return t[0] + "," + t[1];
     }
 
     update() {
@@ -137,7 +185,7 @@ export class SvgOverlay {
         });
     }
 
-    create(tag, attrs, style) {
+    create(tag, attrs, style, parent) {
         let elem = document.createElementNS("http://www.w3.org/2000/svg", tag);
         for (let [k, v] of Object.entries(attrs || {})) {
             elem.setAttribute(k, v);
@@ -146,8 +194,11 @@ export class SvgOverlay {
         for (let [k, v] of Object.entries(style || {})) {
             s[k] = v;
         }
-        if (this.svg) {
-            this.svg.appendChild(elem);
+        if (typeof (parent) === 'undefined') {
+            parent = this.svg;
+        }
+        if (parent) {
+            parent.appendChild(elem);
         }
         return elem;
     }
@@ -155,6 +206,12 @@ export class SvgOverlay {
     createWorldSpacePolyline(points, sectionPlaneHelper) {
         // Changed: for new section
         let node = new PathOverlayNode(this, points, sectionPlaneHelper);
+        this.nodes.push(node);
+        return node;
+    }
+
+    addMeasurement(point, normal, constrain) {
+        let node = new MeasurementNode(this, point, normal, constrain);
         this.nodes.push(node);
         return node;
     }
@@ -177,14 +234,14 @@ export class SvgOverlay {
 
         let svgStyle = this.svg.style;
         var xy = getElementXY(this.track);
-        
+
         // Changed: because of z-index problems
         if (!this.hasWrapper) {
             var xy = getElementXY(this.track);
             svgStyle.left = xy.x + "px";
             svgStyle.top = xy.y + "px";
         }
-        
+
         svgStyle.width = (this.w = this.track.clientWidth) + "px";
         svgStyle.height = (this.h = this.track.clientHeight) + "px";
         this.svg.setAttribute("width", this.w);
@@ -192,6 +249,19 @@ export class SvgOverlay {
         this.svg.setAttribute("viewBox", "0 0 " + this.w + " " + this.h);
         this.w /= 2.;
         this.h /= 2.;
+        this.wh = vec2.fromValues(this.w, this.h);
+
+        // (0,0)
+        // (w,0)
+        // (w,h)
+        // (0,h)
+        this.boundaryPoints[1][0] = this.w * 2;
+        this.boundaryPoints[2][0] = this.w * 2;
+        this.boundaryPoints[2][1] = this.h * 2;
+        this.boundaryPoints[3][1] = this.h * 2;
+
+        this.centerPoint[0] = this.w;
+        this.centerPoint[1] = this.h;
 
         this.aspect = this.w / this.h;
     }

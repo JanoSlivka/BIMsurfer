@@ -1,4 +1,5 @@
 import * as mat4 from "./glmatrix/mat4.js";
+import * as vec4 from "./glmatrix/vec4.js";
 import * as vec3 from "./glmatrix/vec3.js";
 import * as vec2 from "./glmatrix/vec2.js";
 
@@ -17,7 +18,7 @@ export class CameraControl {
 
         this.viewer = viewer;
 
-        this.mousePanSensitivity = 0.5;
+        this.mousePanSensitivity = 1; // 0.5;
         this.mouseOrbitSensitivity = 0.5;
         this.canvasPickTolerance = 4;
 
@@ -30,8 +31,36 @@ export class CameraControl {
         this.lastX = 0; // Last canvas pos while dragging
         this.lastY = 0;
 
+        this.keysDown = new Map();
+        this.keyMapping = {
+            "ArrowRight": "x_neg",
+            "ArrowLeft": "x_pos",
+            "ArrowUp": "z_neg",
+            "ArrowDown": "z_pos",
+            "PageUp": "y_pos",
+            "PageDown": "y_neg",
+            "w": "z_neg",
+            "a": "x_pos",
+            "s": "z_pos",
+            "d": "x_neg",
+            "q": "y_pos",
+            "z": "y_neg"
+        };
+
+        this.axoKeyMapping = {
+            "1": "z_pos",
+            "2": "z_neg",
+            "3": "x_pos",
+            "4": "x_neg",
+            "5": "y_pos",
+            "6": "y_neg",
+        }
+
         this.mouseDown = false;
         this.dragMode = DRAG_ORBIT;
+
+        this._tmp_topleftfront_0 = vec3.create();
+        this._tmp_topleftfront_1 = vec3.create();
 
         this.canvas.oncontextmenu = (e) => {
             e.preventDefault();
@@ -58,6 +87,16 @@ export class CameraControl {
         };
         document.addEventListener("mouseup", this.documentMouseUpHandler);
 
+        this.canvasKeyUpHandler = (e) => {
+            this.canvasKeyProcess(e, false);
+        };
+        this.canvas.addEventListener("keyup", this.canvasKeyUpHandler);
+
+        this.canvasKeyDownHandler = (e) => {
+            this.canvasKeyProcess(e, true);
+        };
+        this.canvas.addEventListener("keydown", this.canvasKeyDownHandler);
+
         this.canvas.addEventListener("mouseenter", this.canvasMouseEnterHandler = (e) => {
             this.over = true;
             e.preventDefault();
@@ -75,6 +114,20 @@ export class CameraControl {
         this.canvas.addEventListener("wheel", this.canvasMouseWheelHandler = (e) => {
             this.canvasWheel(e);
         });
+
+        this.canvas.addEventListener("touchstart", this.touchStartHandler = (e) => {
+            this.canvasMouseDown(e);
+        });
+
+        this.canvas.addEventListener("touchend", this.touchEndHandler = (e) => {
+            this.canvasMouseUp(e);
+        });
+
+        this.canvas.addEventListener("touchmove", this.touchMoveHandler = (e) => {
+            this.canvasMouseMove(e);
+        });
+
+        window.setInterval(this.keyTick.bind(this), 10);
     }
 
     /**
@@ -86,20 +139,31 @@ export class CameraControl {
             canvasPos[0] = event.x;
             canvasPos[1] = event.y;
         } else {
-            //            var element = event.target;
-            var totalOffsetLeft = 0;
-            var totalOffsetTop = 0;
-            //            while (element.offsetParent) {
-            //                totalOffsetLeft += element.offsetLeft;
-            //                totalOffsetTop += element.offsetTop;
-            //                element = element.offsetParent;
-            //            }
-
-            var rect = event.target.getBoundingClientRect();
-            totalOffsetLeft = rect.left;
-            totalOffsetTop = rect.top;
-            canvasPos[0] = event.pageX - totalOffsetLeft;
-            canvasPos[1] = event.pageY - totalOffsetTop;
+            let pageX = null, pageY = null;
+            if (window.TouchEvent && event instanceof TouchEvent) {
+                if (event.touches.length == 0) {
+                    return;
+                }
+                if (event.touches.length == 2) {
+                    let coords = Array.from(event.touches).map(t => vec2.fromValues(t.pageX, t.pageY));
+                    this.pinchDistance = vec2.length(vec2.sub(vec2.create(), ...coords));
+                    let avg = vec2.add(vec2.create(), ...coords);
+                    vec2.scale(avg, avg, 0.5);
+                    pageX = avg[0];
+                    pageY = avg[1];
+                } else {
+                    pageX = event.touches[0].pageX;
+                    pageY = event.touches[0].pageY;
+                }
+            } else {
+                pageX = event.pageX;
+                pageY = event.pageY;
+            }
+            const rect = event.target.getBoundingClientRect();
+            const totalOffsetLeft = rect.left;
+            const totalOffsetTop = rect.top;
+            canvasPos[0] = pageX - totalOffsetLeft;
+            canvasPos[1] = pageY - totalOffsetTop;
         }
         return canvasPos;
     }
@@ -140,6 +204,8 @@ export class CameraControl {
      * @private
      */
     canvasMouseDown(e) {
+        this.lastPan = +new Date();
+
         this.getCanvasPosFromEvent(e, this.mousePos);
 
         this.lastX = this.mousePos[0];
@@ -149,61 +215,73 @@ export class CameraControl {
         this.mouseDownTime = e.timeStamp;
         this.mouseDownPos.set(this.mousePos);
 
-        switch (e.which) {
-            case 1:
-                // Changed: for section use shift
-                if (e.shiftKey) {
-                    this.mouseDownTime = 0;
-                    if (this.viewer.enableSectionPlane({
-                        canvasPos: [this.lastX, this.lastY]
-                    })) {
-                        this.dragMode = DRAG_SECTION;
-                    } else if (!this.viewer.sectionPlaneIsDisabled) {
-                        this.viewer.disableSectionPlane();
-                        this.dragMode = DRAG_ORBIT;
-                    }
-                    this.viewer.removeSectionPlaneWidget();
-                } else {
-                    this.dragMode = DRAG_ORBIT;
-                    let picked = this.viewer.pick({
-                        canvasPos: [this.lastX, this.lastY],
-                        select: false
-                    });
-                    if (picked && picked.coordinates && picked.object) {
-                        this.viewer.camera.center = picked.coordinates;
-                    } else {
-                        // Check if we can 'see' the previous center. If not, pick
-                        // a new point.
-                        let center_vp = vec3.transformMat4(vec3.create(), this.viewer.camera.center, this.viewer.camera.viewProjMatrix);
+        let handleSection = () => {
+            this.mouseDownTime = 0;
+            if (this.viewer.enableSectionPlane({ canvasPos: [this.lastX, this.lastY] })) {
+                this.dragMode = DRAG_SECTION;
+            } else if (!this.viewer.sectionPlaneIsDisabled) {
+                this.viewer.disableSectionPlane();
+                this.dragMode = DRAG_ORBIT;
+            }
+            this.viewer.removeSectionPlaneWidget();
+        }
 
-                        let isv = true;
-                        for (let i = 0; i < 3; ++i) {
-                            if (center_vp[i] < -1. || center_vp[i] > 1.) {
-                                isv = false;
-                                break;
-                            }
-                        }
+        let handleOrbit = () => {
+            this.dragMode = e.shiftKey ? DRAG_PAN : DRAG_ORBIT;
+            let picked = this.viewer.pick({ canvasPos: [this.lastX, this.lastY], select: false });
+            if (picked && picked.coordinates && picked.object) {
+                this.viewer.camera.center = picked.coordinates;
+            } else {
+                // Check if we can 'see' the previous center. If not, pick
+                // a new point.
+                let center_vp = vec3.transformMat4(vec3.create(), this.viewer.camera.center, this.viewer.camera.viewProjMatrix);
 
-                        if (!isv) {
-                            let [x, y] = this.mousePos;
-                            vec3.set(center_vp, x / this.viewer.width * 2 - 1, -y / this.viewer.height * 2 + 1, 1.);
-                            vec3.transformMat4(center_vp, center_vp, this.camera.viewProjMatrixInverted);
-                            vec3.subtract(center_vp, center_vp, this.camera.eye);
-                            vec3.normalize(center_vp, center_vp);
-                            vec3.scale(center_vp, center_vp, this.getZoomRate() * 10.);
-                            vec3.add(center_vp, center_vp, this.camera.eye);
-                            console.log("new center", center_vp);
-                            this.viewer.camera.center = center_vp;
-                        }
+                let isv = true;
+                for (let i = 0; i < 3; ++i) {
+                    if (center_vp[i] < -1. || center_vp[i] > 1.) {
+                        isv = false;
+                        break;
                     }
                 }
-                break;
-            case 2:
-                this.dragMode = DRAG_PAN;
-                break;
-            default:
-                break;
+
+                if (!isv) {
+                    let [x, y] = this.mousePos;
+                    vec3.set(center_vp, x / this.viewer.width * 2 - 1, - y / this.viewer.height * 2 + 1, 1.);
+                    vec3.transformMat4(center_vp, center_vp, this.camera.viewProjMatrixInverted);
+                    vec3.subtract(center_vp, center_vp, this.camera.eye);
+                    vec3.normalize(center_vp, center_vp);
+                    vec3.scale(center_vp, center_vp, this.getZoomRate() * 10.);
+                    vec3.add(center_vp, center_vp, this.camera.eye);
+                    console.log("new center", center_vp);
+                    this.viewer.camera.center = center_vp;
+                }
+            }
+        };
+
+        let handlePan = () => {
+            this.dragMode = DRAG_PAN;
         }
+
+        if (window.TouchEvent && e instanceof TouchEvent) {
+            if (e.touches.length == 1) {
+                handleOrbit();
+            } else if (e.touches.length == 2) {
+                this.lastPinchDistance = this.pinchDistance;
+                handlePan();
+            } else if (e.touches.length == 3) {
+                handleSection();
+            }
+        } else {
+            // Changed: for section use shift
+            if (e.which == 1 && e.shiftKey) {
+                handleSection();
+            } else if (e.which == 1) {
+                handleOrbit();
+            } else if (e.which == 2) {
+                handlePan();
+            }
+        }
+
         this.over = true;
         // Changed: for multiselect is used Ctrl key
         if (this.dragMode == DRAG_PAN || e.ctrlKey) {
@@ -222,23 +300,35 @@ export class CameraControl {
         let dt = e.timeStamp - this.mouseDownTime;
         this.mouseDown = false;
 
-        switch (e.which) {
-            case 1:
-                if (dt < 500. && this.closeEnoughCanvas(this.mouseDownPos, this.mousePos)) {
-                    var viewObject = this.viewer.pick({
-                        canvasPos: this.mousePos,
-                        // Changed: for multiselect is used Ctrl key
-                        shiftKey: e.ctrlKey,
-                        // Changed: for new section
-                        select: this.isSelectionEnabled
-                    });
-                    if (viewObject && viewObject.object) {
-                        console.log("Picked", viewObject.object);
-                    }
-                    this.viewer.drawScene();
-                }
-                break;
+        let handleMeasurement = () => {
+            this.viewer.setMeasurementPoint({ canvasPos: [this.lastX, this.lastY], commit: true });
         }
+
+        const handleClick = () => {
+            if (dt < 500. && this.closeEnoughCanvas(this.mouseDownPos, this.mousePos)) {
+                if (this.viewer.activeMeasurement || (e.ctrlKey && e.altKey)) {
+                    return handleMeasurement();
+                }
+
+                var viewObject = this.viewer.pick({
+                    canvasPos: this.mousePos,
+                    // Changed: for new section
+                    select: this.isSelectionEnabled, // e.which == 3,                    
+                    // Changed: for multiselect is used Ctrl key
+                    shiftKey: (e.which == 1 || e.which == 0) ? e.ctrlKey : this.viewer.selectedElements.size > 0, // e.which == 0 on touch events
+                    onlyAdd: e.which == 3 && this.viewer.selectedElements.size > 0
+                });
+                if (viewObject && viewObject.object) {
+                    console.log("Picked", viewObject.object);
+                }
+                this.viewer.drawScene();
+            }
+        }
+
+        if ((window.TouchEvent && e instanceof TouchEvent && this.dragMode == DRAG_ORBIT) || (e instanceof MouseEvent && e.which == 1)) {
+            handleClick();
+        }
+
         e.preventDefault();
     }
 
@@ -252,9 +342,75 @@ export class CameraControl {
             return;
         }
         var d = delta / Math.abs(delta);
-        var zoom = -d * this.getZoomRate() * this.mousePanSensitivity;
+        var zoom = -d * this.getEyeLookDist() / 20.;
         this.camera.zoom(zoom, this.mousePos);
         e.preventDefault();
+    }
+
+    keyTick() {
+        let f;
+        if (this.keysDown.size) {
+            f = this.getEyeLookDist() / 600;
+        }
+        let vec = [0., 0., 0.];
+        this.keysDown.forEach((v, action) => {
+            if (v) {
+                let axis = action.charCodeAt(0) - 120;
+                let direction = action.charAt(2) == 'p';
+                vec[axis] += direction ? +f : -f;
+            }
+        });
+        if (this.keysDown.size) {
+            this.camera.pan(vec);
+        }
+    }
+
+    moveToAxo(axo) {
+        this._tmp_topleftfront_0[0] = this._tmp_topleftfront_1[0] = (this.viewer.modelBounds[0] + this.viewer.modelBounds[3]) / 2;
+        this._tmp_topleftfront_0[1] = this._tmp_topleftfront_1[1] = (this.viewer.modelBounds[1] + this.viewer.modelBounds[4]) / 2;
+        this._tmp_topleftfront_0[2] = this._tmp_topleftfront_1[2] = (this.viewer.modelBounds[2] + this.viewer.modelBounds[5]) / 2;
+
+        let axis = axo.charCodeAt(0) - 120;
+        let direction = axo.charAt(2) == 'p';
+        this._tmp_topleftfront_0[axis] = this.viewer.modelBounds[axis + (direction ? 3 : 0)];
+
+        this.camera.calcViewFit(null, null, this._tmp_topleftfront_0, this._tmp_topleftfront_1);
+
+        this.camera.interpolateView(this._tmp_topleftfront_0, this._tmp_topleftfront_1);
+    }
+
+    canvasKeyProcess(e, state) {
+        let axo = this.axoKeyMapping[e.key];
+        if (axo && state == false) {
+            this.moveToAxo(axo);
+            return;
+        }
+        let action = this.keyMapping[e.key];
+        if (action) {
+            if (state) {
+                this.keysDown.set(action, state);
+            } else {
+                this.keysDown.delete(action);
+            }
+        } else if (e.key == "Control" || e.key == "Alt") {
+            if (state == (e.key == "Control")) {
+                if (this.viewer.sectionPlaneIsDisabled) {
+                    this.viewer.positionSectionPlaneWidget({ canvasPos: [this.lastX, this.lastY] });
+                }
+            } else {
+                this.viewer.removeSectionPlaneWidget();
+            }
+        } else if (e.key == "Shift" && this.viewer.activeMeasurement) {
+            this.viewer.setMeasurementConstrained(state);
+        } else if (e.key == "Home") {
+            this.camera.viewFit({ animate: true });
+            this.viewer.dirty = 2;
+        } else if (e.key == "Insert") {
+            // Should show the model from the side
+            this.camera.target = [0, 0, 0];
+            this.camera.eye = [1, 0, 0];
+            this.camera.viewFit({ aabb: this.camera.modelBounds, animate: true });
+        }
     }
 
     /**
@@ -275,17 +431,15 @@ export class CameraControl {
             return;
         }
         // Changed: for section use shift
-        if (this.mouseDown || e.shiftKey) {
+        if (this.mouseDown || e.shiftKey || (e.ctrlKey && !e.altKey) || this.viewer.activeMeasurement) {
             this.getCanvasPosFromEvent(e, this.mousePos);
-            if (this.dragMode == DRAG_SECTION) {
-                this.viewer.moveSectionPlane({
-                    canvasPos: this.mousePos
-                });
+            if (this.viewer.activeMeasurement && !this.mouseDown) {
+                this.viewer.setMeasurementPoint({ canvasPos: this.mousePos, commit: false });
+            } else if (this.dragMode == DRAG_SECTION) {
+                this.viewer.moveSectionPlane({ canvasPos: this.mousePos });
                 // Changed: for section use shift
             } else if (e.shiftKey) {
-                this.viewer.positionSectionPlaneWidget({
-                    canvasPos: this.mousePos
-                });
+                this.viewer.positionSectionPlaneWidget({ canvasPos: this.mousePos });
             } else {
                 var x = this.mousePos[0];
                 var y = this.mousePos[1];
@@ -303,8 +457,22 @@ export class CameraControl {
                     }
                     this.camera.orbitting = true;
                 } else if (this.dragMode == DRAG_PAN) {
-                    var f = this.getEyeLookDist() / 600;
-                    this.camera.pan([xDelta * f, yDelta * this.mousePanSensitivity * f, 0.0]);
+                    // tfk: using the elapsed time didn't seem to make navigation smoother.
+
+                    // let now = +new Date();
+                    // let elapsed = now - this.lastPan;
+                    // elapsed /= 20.;
+
+                    let dist = this.getEyeLookDist();
+                    if (window.TouchEvent && e instanceof TouchEvent && e.touches.length == 2) {
+                        let factor = Math.pow(this.pinchDistance / this.lastPinchDistance, 0.5);
+                        this.camera.zoom(dist - dist * factor, this.mousePos);
+                        this.lastPinchDistance = this.pinchDistance;
+                    }
+                    var f = dist / 600;
+                    // f *= elapsed;
+                    this.camera.pan([xDelta * f, yDelta * f, 0.0]);
+                    // this.lastPan = now;
                 }
             }
         }
@@ -326,8 +494,17 @@ export class CameraControl {
     }
 
     getEyeLookDist() {
-        var vec = vec3.create();
-        return vec3.length(vec3.subtract(vec, this.viewer.camera.target, this.viewer.camera.eye));
+        let d = this.viewer.lastRecordedDepth;
+        if (!this.mouseDown && !this.keysDown.size && ((+new Date()) - this.viewer.recordedDepthAt) > 500) {
+            // Reread depth at mouse coordinates for sensitivity measures
+            this.viewer.pick({ canvasPos: this.mousePos, select: false });
+        }
+        if (d === null) {
+            return this.getZoomRate() * 20.;
+        } else {
+            // Always add a bit so that we can zoom past a window
+            return d + this.getZoomRate();
+        }
     }
 
     /**
@@ -339,6 +516,8 @@ export class CameraControl {
         canvas.removeEventListener("mousedown", this.canvasMouseDownHandler);
         canvas.removeEventListener("mouseup", this.canvasMouseUpHandler);
         document.removeEventListener("mouseup", this.documentMouseUpHandler);
+        canvas.removeEventListener("keyup", this.canvasKeyUpHandler);
+        canvas.removeEventListener("keydown", this.canvastKeyDownHandler);
         canvas.removeEventListener("mouseenter", this.canvasMouseEnterHandler);
         canvas.removeEventListener("mouseleave", this.canvasMouseLeaveHandler);
         canvas.removeEventListener("mousemove", this.canvasMouseMoveHandler);

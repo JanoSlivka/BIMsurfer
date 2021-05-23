@@ -61,7 +61,7 @@ export class DefaultSettings {
 			settings.defaultLayerEnabled = true;
 		}
 		if (settings.tilingLayerEnabled == null) {
-			settings.tilingLayerEnabled = true;
+			settings.tilingLayerEnabled = false;
 		}
 		if (settings.maxOctreeDepth == null) {
 			settings.maxOctreeDepth = 5;
@@ -99,7 +99,7 @@ export class DefaultSettings {
 			settings.excludedTypes = ["IfcSpace", "IfcOpeningElement", "IfcAnnotation"];
 		}
 		if (settings.loaderSettings.tilingLayerReuse == null) {
-			settings.loaderSettings.tilingLayerReuse = true;
+			settings.loaderSettings.tilingLayerReuse = false;
 		}
 		if (settings.loaderSettings.reuseThreshold == null) {
 			settings.loaderSettings.reuseThreshold = 25000;

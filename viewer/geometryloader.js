@@ -7,7 +7,7 @@ import {DataInputStream} from "./datainputstream.js";
 
 import {AvlTree} from "./collections/avltree.js";
 
-const PROTOCOL_VERSION = 20;
+const PROTOCOL_VERSIONS = new Set([20, 21]);
 
 /**
  * This class is supposed to be and stay BIMserver-free.
@@ -50,7 +50,7 @@ export class GeometryLoader {
 		this.uniqueIdsLoaded = [];
 	}
 	
-	processPreparedBufferInit(stream, hasTransparancy) {
+	processPreparedBufferInit(stream, hasTransparancy, hasTwoSidedTriangles) {
 		this.preparedBuffer = {};
 
 		this.preparedBuffer.nrObjects = stream.readInt();
@@ -81,9 +81,11 @@ export class GeometryLoader {
 		this.preparedBuffer.pickColors = Utils.createEmptyBuffer(this.renderLayer.gl, this.preparedBuffer.nrColors, this.renderLayer.gl.ARRAY_BUFFER, 4, WebGL2RenderingContext.UNSIGNED_BYTE, "Uint8Array");
 
 		this.preparedBuffer.uniqueIdToIndex = new AvlTree(this.renderLayer.viewer.inverseUniqueIdCompareFunction);
-
+		this.preparedBuffer.uniqueIdSet = new Set();
+		
 		this.preparedBuffer.loaderId = this.loaderId;
 		this.preparedBuffer.hasTransparency = hasTransparancy;
+		this.preparedBuffer.hasTwoSidedTriangles = hasTwoSidedTriangles;
 
 		if (this.loaderSettings.quantizeVertices) {
 			this.preparedBuffer.unquantizationMatrix = this.unquantizationMatrix;
@@ -94,7 +96,7 @@ export class GeometryLoader {
 		stream.align8();
 	}
 
-	processPreparedBuffer(stream, hasTransparancy) {
+	processPreparedBuffer(stream, hasTransparancy, hasTwoSidedTriangles) {
 		const loadedViewObjects = [];
 
 		const nrObjects = stream.readInt();
@@ -147,15 +149,9 @@ export class GeometryLoader {
 		const collectedMetaObjects = [];
 		
 		for (var i = 0; i < nrObjects; i++) {
-			var uniqueId = null;
-			if (this.loaderSettings.useUuidAndRid) {
-				let oid = stream.readInt();
-				let mid = stream.readLong();
-				uniqueId = oid + "-" + mid;
-			} else {
-				uniqueId = stream.readLong();
-			}
+			var uniqueId = this.readAndCreateUniqueId(stream);
 			this.uniqueIdsLoaded.push(uniqueId);
+			this.preparedBuffer.uniqueIdSet.add(uniqueId);
 
 			var startIndex = stream.readInt();
 			var startLineIndex = stream.readInt();
@@ -164,6 +160,7 @@ export class GeometryLoader {
 			var nrVertices = stream.readInt();
 			var minIndex = stream.readInt();
 			var maxIndex = stream.readInt();
+			
 			if (this.loaderSettings.generateLineRenders) {
 				var minLineIndex = stream.readInt();
 				var maxLineIndex = stream.readInt();
@@ -305,13 +302,20 @@ export class GeometryLoader {
 							}
 						}
 					}
-					var globalizedAabb = Utils.transformBounds(aabb, this.renderLayer.viewer.globalTranslationVector);			
+					
+					var globalizedAabb;
+					if (this.renderLayer.viewer.globalTranslationVector) {
+						globalizedAabb = Utils.transformBounds(aabb, this.renderLayer.viewer.globalTranslationVector);
+					} else {
+						globalizedAabb = aabb;
+					}
 					const viewobj = this.renderLayer.viewer.getViewObject(oid);
+					viewobj.renderLayer = this.renderLayer;
 					viewobj.aabb = aabb;
 					viewobj.globalizedAabb = globalizedAabb;
+					this.renderLayer.viewer.setModelBounds(aabb);
 				}
 			}
-
 		}
 		
 		if (this.settings.quantizeNormals) {
@@ -433,18 +437,24 @@ export class GeometryLoader {
 		var normals;
 		var numColors;
 		var colors = null;
-
+		
 		if (geometryType == 1) {
 			// Geometry
 			var reused = stream.readInt();
+			
 			var type = stream.readUTF8();
 			stream.align8();
 			var roid = stream.readLong();
-			var croid = stream.readLong();
+			var uniqueModelId = this.readAndCreateUniqueModelId(stream);
 			let hasTransparencyValue = stream.readLong();
 			var hasTransparency = hasTransparencyValue == 1;
+			if (this.protocolVersion == 21) {
+				var hasTwoSidedTriangles = stream.readLong() == 1;
+			} else {
+				var hasTwoSidedTriangles = true;
+			}
 			var geometryDataId = stream.readLong();
-			this.readGeometry(stream, roid, croid, geometryDataId, geometryDataId, hasTransparency, reused, type, true);
+			this.readGeometry(stream, roid, uniqueModelId, geometryDataId, geometryDataId, hasTransparency, hasTwoSidedTriangles, reused, type, true);
 			if (this.dataToInfo.has(geometryDataId)) {
 				// There are objects that have already been loaded, that are waiting for this GeometryData
 				var oids = this.dataToInfo.get(geometryDataId);
@@ -462,14 +472,7 @@ export class GeometryLoader {
 		} else if (geometryType == 5) {
 			// Object
 			var inPreparedBuffer = stream.readByte() == 1;
-			var uniqueId = null;
-			if (this.loaderSettings.useUuidAndRid) {
-				let oid = stream.readInt();
-				let mid = stream.readLong();
-				uniqueId = oid + "-" + mid;
-			} else {
-				uniqueId = stream.readLong();
-			}
+			var uniqueId = this.readAndCreateUniqueId(stream);
 			var type = stream.readUTF8();
 			var nrColors = stream.readInt();
 			stream.align8();
@@ -519,14 +522,7 @@ export class GeometryLoader {
 			this.createObject(roid, uniqueId, geometryDataOidFound == null ? [] : [geometryDataOidFound], matrix, hasTransparency, type, objectBounds, inPreparedBuffer);
 		} else if (geometryType == 9) {
 			// Minimal object
-			var uniqueId = null;
-			if (this.loaderSettings.useUuidAndRid) {
-				let oid = stream.readInt();
-				let mid = stream.readLong();
-				uniqueId = oid + "-" + mid;
-			} else {
-				uniqueId = stream.readLong();
-			}
+			var uniqueId = this.readAndCreateUniqueId(stream);
 			var type = stream.readUTF8();
 			var nrColors = stream.readInt();
 			var roid = stream.readLong();
@@ -552,13 +548,21 @@ export class GeometryLoader {
 			
 			this.createObject(roid, uniqueId, [], null, hasTransparency, type, objectBounds, true);
 		} else if (geometryType == 7) {
-			this.processPreparedBuffer(stream, true);
+			this.processPreparedBuffer(stream, true, false);
 		} else if (geometryType == 8) {
-			this.processPreparedBuffer(stream, false);
+			this.processPreparedBuffer(stream, false, false);
 		} else if (geometryType == 10) {
-			this.processPreparedBufferInit(stream, true);
+			this.processPreparedBufferInit(stream, true, false);
 		} else if (geometryType == 11) {
-			this.processPreparedBufferInit(stream, false);
+			this.processPreparedBufferInit(stream, false, false);
+		} else if (geometryType == 12) {
+			this.processPreparedBuffer(stream, true, true);
+		} else if (geometryType == 13) {
+			this.processPreparedBuffer(stream, false, true);
+		} else if (geometryType == 14) {
+			this.processPreparedBufferInit(stream, true, true);
+		} else if (geometryType == 15) {
+			this.processPreparedBufferInit(stream, false, true);
 		} else {
 			console.error("Unsupported geometry type: " + geometryType);
 			return;
@@ -566,8 +570,26 @@ export class GeometryLoader {
 
 		this.state.nrObjectsRead++;
 	}
+	
+	readAndCreateUniqueId(stream) {
+		if (this.loaderSettings.useUuidAndRid) {
+			let oid = stream.readInt();
+			let mid = stream.readLong();
+			return oid + "-" + mid;
+		} else {
+			var uniqueId = stream.readLong();
+			if (uniqueId === 0) {
+				uniqueId = this.renderLayer.viewer.oidCounter ++;
+			}
+			return uniqueId;
+		}
+	}
+	
+	readAndCreateUniqueModelId(stream) {
+		return stream.readLong(); // On BIMserver, this is croid
+	}
 
-	readGeometry(stream, roid, croid, geometryId, geometryDataOid, hasTransparency, reused, type, useIntForIndices) {
+	readGeometry(stream, roid, uniqueModelId, geometryId, geometryDataOid, hasTransparency, hasTwoSidedTriangles, reused, type, useIntForIndices) {
 		var numIndices = stream.readInt();
 		if (useIntForIndices) {
 			var indices = stream.readIntArray(numIndices);
@@ -640,7 +662,7 @@ export class GeometryLoader {
 		if (colors.length == 0) {
 			debugger;
 		}
-		this.renderLayer.createGeometry(this.loaderId, roid, croid, geometryDataOid, positions, normals, colors, color, indices, lineIndices, hasTransparency, reused);
+		this.renderLayer.createGeometry(this.loaderId, roid, uniqueModelId, geometryDataOid, positions, normals, colors, color, indices, lineIndices, hasTransparency, hasTwoSidedTriangles, reused);
 	}
 
 	readColors(stream, type) {
@@ -712,8 +734,8 @@ export class GeometryLoader {
 
 		this.protocolVersion = data.readByte();
 
-		if (this.protocolVersion != PROTOCOL_VERSION) {
-			console.error("Unimplemented version (protocol: " + this.protocolVersion + ", implemented: " + PROTOCOL_VERSION + ").\nUsually this means you need to either:\n\t- Update the BinarySerializers plugin bundle in BIMserver\n\t- Update your version of BIMsurfer 3");
+		if (!PROTOCOL_VERSIONS.has(this.protocolVersion)) {
+			console.error("Unimplemented version (protocol: " + this.protocolVersion + ", implemented: " + PROTOCOL_VERSIONS + ").\nUsually this means you need to either:\n\t- Update the BinarySerializers plugin bundle in BIMserver\n\t- Update your version of BIMsurfer 3");
 			return false;
 		}
 

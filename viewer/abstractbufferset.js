@@ -8,8 +8,9 @@ var counter = 1;
  */
 export class AbstractBufferSet {
     
-    constructor(viewer) {
+    constructor(viewer, reuse) {
     	this.viewer = viewer;
+    	this.reuse = reuse;
         // Unique id per bufferset, easier to use as Map key
         this.id = counter++;
         
@@ -230,7 +231,18 @@ export class AbstractBufferSet {
             quantize: this.positionBuffer.js_type !== Float32Array.name
         }, this.unquantizationMatrix);
 
-		if (this.lineIndexBuffer != null) {
+		var offset, length;
+		if (this.uniqueIdToIndex == null) {
+			offset = 0;
+			length = this.nrLineIndices;
+		} else {
+			let index = this.uniqueIdToIndex.get(uniqueId);
+			let idx = index[0];
+			offset = idx.lineIndicesStart;
+			length = idx.lineIndicesLength;
+		}
+
+		if (this.lineIndexBuffer != null && typeof(offset) !== 'undefined' && typeof(length) !== 'undefined') {
 			// TODO this is where we are
 			// Problem here is that the buffer is now already created on the GPU, but we need to convert it to a fatlinerenderer...
 			// So we could either generate the line render buffers as fat lines already (taking more network), but real quick to send to GPU, or
@@ -241,16 +253,9 @@ export class AbstractBufferSet {
 			const bounds = this.batchGpuBuffers.bounds;
 			const vertexOffset = -bounds.minIndex * 3;
 			
-			let gpu_data = this.batchGpuBuffers["positionBuffer"];
-
-			let index = this.uniqueIdToIndex.get(uniqueId);
-			let idx = index[0];
-			let [offset, length] = [idx.lineIndicesStart, idx.lineIndicesLength];
-			let [minLineIndex, maxLineIndex] = [idx.minLineIndex, idx.maxLineIndex];
-			
+			let gpu_data = this.batchGpuBuffers.positionBuffer;
+						
 			var indexOffset = offset - bounds.startLineIndex;
-
-			let numVertices = maxLineIndex - minLineIndex + 1;
 
 			lineRenderer.init(length);
 
@@ -274,12 +279,10 @@ export class AbstractBufferSet {
 			let [offset, length] = [idx.start, idx.length];
 			let [minIndex, maxIndex] = [idx.minIndex, idx.maxIndex];
 
-			let numVertices = maxIndex - minIndex + 1;
-			let gpu_data = this.batchGpuBuffers["positionBuffer"];
+			let gpu_data = this.batchGpuBuffers.positionBuffer;
+			let gpu_data_norm = this.batchGpuBuffers.normalBuffer;
 
 			const bounds = this.batchGpuBuffers.bounds;
-			
-			var size = 0;
 			
 			// A more efficient (and certainly more compact) version that used bitshifting was working fine up until 16bits, unfortunately JS only does bitshifting < 32 bits, so now we have this crappy solution
 			
@@ -288,10 +291,27 @@ export class AbstractBufferSet {
 			const s = new Set();
 			
 			const indices = this.batchGpuBuffers.indices;
+
+			// A rather good indiation that we have redundant indices.
+			let use_positions = (indices[indices.length - 1] - indices[0]) == indices.length - 1;
+
 			for (var i=0; i<length; i+=3) {
 				for (let j = 0; j < 3; ++j) {
 					let a = indices[indexOffset + i + j];
 					let b = indices[indexOffset + i + (j+1)%3];
+
+					if (use_positions) {
+						a -= indices[0];
+						b -= indices[0];
+						a = [
+							gpu_data.subarray(a * 3, a * 3 + 3).join(" "),
+							gpu_data_norm.subarray(a * 3, a * 3 + 3).join(" ")
+						].join(',');
+						b = [
+							gpu_data.subarray(b* 3, b * 3 + 3).join(" "),
+							gpu_data_norm.subarray(b * 3, b * 3 + 3).join(" ")
+						].join(',');
+					}
 					
 					if (a > b) {
 						const tmp = a;
@@ -299,8 +319,13 @@ export class AbstractBufferSet {
 						b = tmp;
 					}
 
-					// First tried to do this with bit shifting, but bit shifting in JS is 32bit
-					const abs = a * 67108864 + b; // 2^26=67108864. A maximum of 52 bits is used, staying just under 2^53, which is the max safe int
+					let abs;
+					if (use_positions) {
+						abs = [a, b].join(";");
+					} else {
+						// First tried to do this with bit shifting, but bit shifting in JS is 32bit
+						abs = a * 67108864 + b; // 2^26=67108864. A maximum of 52 bits is used, staying just under 2^53, which is the max safe int
+					}
 					if (s.has(abs)) {
 						s.delete(abs);
 					} else {
@@ -309,15 +334,27 @@ export class AbstractBufferSet {
 				}
 			}
 			
+			let AA = new gpu_data.constructor(3);
+			let BB = new gpu_data.constructor(3);
+
 			lineRenderer.init(s.size);
 			const vertexOffset = -bounds.minIndex * 3;
 			for (let e of s) {
-				const a = Math.floor(e / 67108864);
-				const b = e - a * 67108864;
-				const as = vertexOffset + a * 3;
-				const bs = vertexOffset + b * 3;
-				let A = gpu_data.subarray(as, as + 3);
-				let B = gpu_data.subarray(bs, bs + 3);
+				let A, B;
+				if (use_positions) {
+					let [a_, b_] = e.split(";");
+					AA.set(a_.split(",")[0].split(' '));
+					BB.set(b_.split(",")[0].split(' '));
+					A = AA;
+					B = BB;
+				} else {
+					const a = Math.floor(e / 67108864);
+					const b = e - a * 67108864;
+					const as = vertexOffset + a * 3;
+					const bs = vertexOffset + b * 3;
+					let A = gpu_data.subarray(as, as + 3);
+					let B = gpu_data.subarray(bs, bs + 3);
+				}
 				lineRenderer.pushVertices(A, B);
 			}
 			
@@ -332,39 +369,51 @@ export class AbstractBufferSet {
     	for (const idRange of id_ranges) {
     		const oid = idRange[0];
     		const range = idRange[1];
-    		let idx = this.uniqueIdToIndex.get(oid)[0];
-    		
-    		// Regular indices
-    		if (bounds.startIndex == null || range[0] < bounds.startIndex) {
-    			bounds.startIndex = range[0];
-    		}
-    		if (bounds.endIndex == null || range[1] > bounds.endIndex) {
-    			bounds.endIndex = range[1];
-    		}
-    		if (bounds.minIndex == null || idx.minIndex < bounds.minIndex) {
-    			bounds.minIndex = idx.minIndex;
-    		}
-    		if (bounds.maxIndex == null || idx.maxIndex + 1 > bounds.maxIndex) {
-    			// This one seems to be wrong
-    			bounds.maxIndex = idx.maxIndex + 1;
-    		}
-
-    		// Line indices
-    		if (bounds.startLineIndex == null || range[2] < bounds.startLineIndex) {
-    			bounds.startLineIndex = range[2];
-    		}
-    		if (bounds.endLineIndex == null || range[3] > bounds.endLineIndex) {
-    			bounds.endLineIndex = range[3];
-    		}
-    		if (bounds.startLineIndex > bounds.endLineIndex) {
-    			debugger;
-    		}
-    		if (bounds.minLineIndex == null || idx.minLineIndex < bounds.minLineIndex) {
-    			bounds.minLineIndex = idx.minLineIndex;
-    		}
-    		if (bounds.maxLineIndex == null || idx.maxLineIndex + 1 > bounds.maxLineIndex) {
-    			// This one seems to be wrong
-    			bounds.maxLineIndex = idx.maxLineIndex + 1;
+    		if (this.uniqueIdToIndex) {
+    			let idx = this.uniqueIdToIndex.get(oid)[0];
+    			
+    			// Regular indices
+    			if (bounds.startIndex == null || range[0] < bounds.startIndex) {
+    				bounds.startIndex = range[0];
+    			}
+    			if (bounds.endIndex == null || range[1] > bounds.endIndex) {
+    				bounds.endIndex = range[1];
+    			}
+    			if (bounds.minIndex == null || idx.minIndex < bounds.minIndex) {
+    				bounds.minIndex = idx.minIndex;
+    			}
+    			if (bounds.maxIndex == null || idx.maxIndex + 1 > bounds.maxIndex) {
+    				// This one seems to be wrong
+    				bounds.maxIndex = idx.maxIndex + 1;
+    			}
+    			
+    			// Line indices
+    			if (bounds.startLineIndex == null || range[2] < bounds.startLineIndex) {
+    				bounds.startLineIndex = range[2];
+    			}
+    			if (bounds.endLineIndex == null || range[3] > bounds.endLineIndex) {
+    				bounds.endLineIndex = range[3];
+    			}
+    			if (bounds.startLineIndex > bounds.endLineIndex) {
+    				debugger;
+    			}
+    			if (bounds.minLineIndex == null || idx.minLineIndex < bounds.minLineIndex) {
+    				bounds.minLineIndex = idx.minLineIndex;
+    			}
+    			if (bounds.maxLineIndex == null || idx.maxLineIndex + 1 > bounds.maxLineIndex) {
+    				// This one seems to be wrong
+    				bounds.maxLineIndex = idx.maxLineIndex;
+    			}
+    		} else {
+    			// TODO
+    			bounds.startIndex = 0;
+    			bounds.endIndex = 0;
+    			bounds.minIndex = 0;
+    			bounds.maxIndex = 0;
+    			bounds.startLineIndex = 0;
+    			bounds.endLineIndex = 0;
+    			bounds.minLineIndex = 0;
+    			bounds.maxLineIndex = 0;
     		}
     	}
     	return bounds;
@@ -420,7 +469,7 @@ export class AbstractBufferSet {
         if (!exclude && ranges.instanceIds.length && this.lineIndexBuffers.size === 0) {
             let lineRenderer = this.createLineRendererFromInstance(gl, 0, this.indexBuffer.N);
             // This will result in a different dequantization matrix later on, not sure why
-            lineRenderer.croid = this.croid;
+            lineRenderer.uniqueModelId = this.uniqueModelId;
             this.objects.forEach((ob) => {
                 lineRenderer.matrixMap.set(ob.uniqueId, ob.matrix);
                 this.lineIndexBuffers.set(ob.uniqueId, lineRenderer);
@@ -482,6 +531,18 @@ export class AbstractBufferSet {
     	}
     }
 	
+    generateIdRanges(uniqueId, gl) {
+    	if (this.uniqueIdToIndex) {
+    		var indices = this.uniqueIdToIndex.get(uniqueId);
+    		for (var j = 0; j < indices.length; ++j) {
+    			const mapping = indices[j];
+    			return [[uniqueId, [mapping.start, mapping.start + mapping.length, mapping.lineIndicesStart, mapping.lineIndicesStart + mapping.lineIndicesLength]]];
+    		}
+    	} else {
+    		return [[uniqueId, [0, this.nrIndices, 0, this.nrLineIndices]]];
+    	}
+    }
+    
     computeVisibleRangesAsBuffers(ids_with_or_without, gl) {
     	if (this.dirty) {
     		// TODO maybe we can reuse something here?
@@ -558,6 +619,7 @@ export class AbstractBufferSet {
     	}
     	
     	this.lastIdRanges = id_ranges;
+    	this.lastExclude = exclude;
     	
     	result = this.joinConsecutiveRangesAsBuffers(result);
     	
@@ -590,27 +652,45 @@ export class AbstractBufferSet {
     	if (lines) {
     		return lines;
     	}
+    	if (this.uniqueIdToIndex != null && !this.uniqueIdToIndex.has(requestedId)) {
+    		return null;
+    	}
     	this.generateLines(requestedId, gl);
     	return null;
     }
     
     generateLines(requestedId, gl) {
-    	// TODO this method should generate lines for just one object
-    	if (this.lastIdRanges) {
-    		let bounds = this.getBounds(this.lastIdRanges);
-    		
-    		this.batchGpuRead(gl, ["positionBuffer"], bounds, () => {
-    			this.lastIdRanges.forEach((range, i) => {
-    				let [id, [a, b]] = range;
-    				if (this.lineIndexBuffers.has(id)) {
-    					return;
-    				}
-    				let lineRenderer = this.createLineRenderer(gl, id, a, b);
-    				this.lineIndexBuffers.set(id, lineRenderer);
-    			});
-    		});
-    		this.viewer.dirty = 2;
+    	if (this.reuse) {
+            let lineRenderer = this.createLineRendererFromInstance(gl, 0, this.indexBuffer.N);
+            // This will result in a different dequantization matrix later on, not sure why
+            lineRenderer.uniqueModelId = this.uniqueModelId;
+            this.objects.forEach((ob) => {
+                lineRenderer.matrixMap.set(ob.uniqueId, ob.matrix);
+                this.lineIndexBuffers.set(ob.uniqueId, lineRenderer);
+            });
+            return;
     	}
+
+    	let id_ranges = this.generateIdRanges(requestedId, gl);
+		let bounds = this.getBounds(id_ranges);
+		
+		if (id_ranges.length == 0) {
+			let lineRenderer = this.createLineRenderer(gl, requestedId, 0, 0);
+			this.lineIndexBuffers.set(requestedId, lineRenderer);
+		} else {
+			// @todo normalBuffer is actually only required when we don't have indices,
+			// so we need to decide which lines to render based on positions and normals
+			this.batchGpuRead(gl, ["positionBuffer", "normalBuffer"], bounds, () => {
+				id_ranges.forEach((range, i) => {
+					let [id, [a, b]] = range;
+					if (id == requestedId) {
+						let lineRenderer = this.createLineRenderer(gl, id, a, b);
+						this.lineIndexBuffers.set(id, lineRenderer);
+					}
+				});
+				this.viewer.dirty = 2;
+			});
+		}
     }
     
     storeInCacheAndReturn(key, result, nonce) {
@@ -632,10 +712,20 @@ export class AbstractBufferSet {
 		this.nrIndices = 0;
 		this.bytes = 0;
 		this.visibleRanges = new Map();
-		this.uniqueIdToIndex = new AvlTree(viewer.inverseUniqueIdCompareFunction);
+		this.uniqueIdSet = new Set();
+		if (!this.reuse) {
+			this.uniqueIdToIndex = new AvlTree(viewer.inverseUniqueIdCompareFunction);
+		}
 		this.lineIndexBuffers = new Map();
 	}
 
+	has(uniqueId) {
+		if (this.uniqueIdSet == null) {
+			debugger;
+		}
+		return this.uniqueIdSet.has(uniqueId);
+	}
+	
 	copy(gl, uniqueId) {
         let returnDictionary = {};
 
@@ -644,10 +734,11 @@ export class AbstractBufferSet {
         } else {
     		let idx = this.uniqueIdToIndex.get(uniqueId)[0];
 
+    		let bounds = this.batchGpuBuffers.bounds;
+
     		let [offset, length] = [idx.start, idx.length];
 			const indices = new Uint32Array(length);
 			let [minIndex, maxIndex] = [idx.minIndex, idx.maxIndex];
-			let bounds = this.batchGpuBuffers.bounds;
 			for (let i=0; i<length; i++) {
 				indices[i] = this.batchGpuBuffers.indices[-bounds.startIndex + offset + i] - minIndex;
 			}
@@ -655,10 +746,11 @@ export class AbstractBufferSet {
 			let [lineIndexOffset, lineIndexLength] = [idx.lineIndicesStart, idx.lineIndicesLength];
 			const lineIndices = new Uint32Array(lineIndexLength);
 			let [minLineIndex, maxLineIndex] = [idx.minLineIndex, idx.maxLineIndex];
+			
 			for (let i=0; i<lineIndexLength; i++) {
-				lineIndices[i] = this.batchGpuBuffers.lineIndices[-bounds.startLineIndex + lineIndexOffset + i] - minLineIndex;
+				lineIndices[i] = (this.batchGpuBuffers.lineIndices[-bounds.startLineIndex + lineIndexOffset + i] - minLineIndex) + 1;
 			}
-    		
+
     		let numVertices = maxIndex - minIndex + 1;
     		
     		let toCopy = ["positionBuffer", "normalBuffer", "colorBuffer", "pickColorBuffer"];
@@ -680,10 +772,12 @@ export class AbstractBufferSet {
     		}
     		
     		returnDictionary.isCopy = true;
+    		returnDictionary["uniqueIdSet"] = this.uniqueIdSet;
     		returnDictionary["indices"] = indices;
     		returnDictionary["nrIndices"] = indices.length;
     		returnDictionary["lineIndices"] = lineIndices;
     		returnDictionary["nrLineIndices"] = lineIndices.length;
+    		returnDictionary["lineIndexBuffers"] = this.lineIndexBuffers;
         }
 
 		return returnDictionary;
